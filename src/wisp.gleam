@@ -21,6 +21,7 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option}
 import gleam/otp/actor
+import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import gleam/string_tree.{type StringTree}
@@ -29,8 +30,8 @@ import houdini
 import logging
 import marceau
 import process_file
+import relay_supervisor as supervisor
 import simplifile
-import wisp/internal/supervisor
 
 //
 // Responses
@@ -558,7 +559,7 @@ pub opaque type Connection {
     max_files_size: Int,
     read_chunk_size: Int,
     secret_key_base: String,
-    new_temporary_file: fn() -> String,
+    new_temporary_file: fn() -> Result(String, Nil),
   )
 }
 
@@ -2231,40 +2232,33 @@ pub fn start(
     let file_manager_template =
       supervisor.Template(
         start: fn(_) { process_file.start() },
-        child_type: supervisor.Worker(shutdown_ms: 2000),
+        child_type: supervision.Worker(shutdown_ms: 2000),
       )
 
     let server_template =
       supervisor.Template(
         start: server.start,
-        child_type: supervisor.Supervisor,
+        child_type: supervision.Supervisor,
       )
 
     // TODO: we need to pass the server information in. port, binding, etc.
     // TODO: we need the secret key.
-    let server_connection_callback = fn(manager, reader) {
+    let make_connection = fn(manager, reader) {
       make_connection(
         reader,
         todo as "secret key. maybe should be moved elsewhere",
         fn() {
           let path = filepath.join(temporary_directory, random_slug())
-          // TODO: handle error
-          let assert Ok(_) = process_file.register(manager, path)
-          path
+          process_file.register(manager, path)
         },
       )
     }
 
     children
-    |> supervisor.child(
-      from: file_manager_template,
-      taking: fn(nil) { nil },
-      returning: fn(_, file_manager) { file_manager },
-    )
-    |> supervisor.child(
-      from: server_template,
-      taking: fn(manager) { server_connection_callback(manager, _) },
-      returning: fn(_, _) { Nil },
+    |> supervisor.add(supervisor.child(file_manager_template))
+    |> supervisor.add(
+      supervisor.child(server_template)
+      |> supervisor.providing(fn(manager) { make_connection(manager, _) }),
     )
   })
   |> supervisor.start
@@ -2282,7 +2276,7 @@ fn remove_preceeding_slashes(string: String) -> String {
 pub fn make_connection(
   body_reader: Reader,
   secret_key_base: String,
-  new_temporary_file: fn() -> String,
+  new_temporary_file: fn() -> Result(String, Nil),
 ) -> Connection {
   Connection(
     reader: body_reader,
